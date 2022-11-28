@@ -10,8 +10,21 @@ import matplotlib.pyplot as plt
 from PIL import Image
 
 from basic import * 
+import config
+import pymysql 
+import pandas as pd
+from datetime import timedelta, date, datetime
+import shutil
 
 device = torch.device('cpu')
+def connection():
+    conn = pymysql.connect(host=config.host,
+                            user=config.username,
+                            passwd=config.password, 
+                            db=config.database, 
+                            port=config.port, charset='utf8')
+    cursor = conn.cursor()
+    return conn, cursor
 
 class DetectCriminalSign:
 
@@ -32,7 +45,22 @@ class DetectCriminalSign:
         # 신호등 판별 모델
         self.light_cf_model = torch.load('./light_classfication.pth', map_location=device)
         self.detect_motorcycle_model = torch.hub.load('ultralytics/yolov5', 'custom', path='detect_motorcycle.pt')
-    
+        
+        self.conn, self.cursor = connection()
+
+    # DB Insert 함수
+    # input : 위반 정보
+    # output : 업데이트
+    def insert_data_to_DB(self, value):
+
+        # ex ) ["보행자 도로 위반", 4, '2022-09-27 09:10:01', 'C000002']
+        print(value)
+        insert_sql = f"insert into crime(crime_type,crime_cnt,time,cctv_id) values ('{value[0]}', {value[1]},'{value[2]}','{value[3]}');"
+
+        self.cursor.execute(insert_sql)
+        self.conn.commit()
+        print("INSERT_완료", value[0], value[1])
+
     # 비디오에서 사진 뽑아오는 함수
     # input : 비디오 경로, 저장할 경로
     # output : (이미지 자체 저장)
@@ -116,13 +144,12 @@ class DetectCriminalSign:
             else:
                 print(f"{video_code} : 해당 video에 대한 정지선 정보가 없어 확인이 필요합니다. ")
 
-
     # 오토바이 모델 탐지 모델 
     # input : image
     # output : detect result (DataFrame)
     def detect_motorcycle(self, image):
         result = self.detect_motorcycle_model(image)
-        result.save(save_dir='results/res')
+        # result.save(save_dir='results/res')
         result = result.pandas().xywh[0] 
         # 확률이 50%이상인 데이터만
         result = result[result['confidence'] >= 0.5]
@@ -164,54 +191,21 @@ class DetectCriminalSign:
         if video_name not in self.sidewalk_dict:
             print(f'{video_name} : 이 CCTV에서는 보행자도로가 없어 탐지가 불가능합니다.')
             return 0
-        
-        mask = self.sidewalk_dict[video_name]
-        
-        
+
         result = {'STATE_0' : 0, 'STATE_1':0, 'STATE_2':0}
 
         # 이미지의 목록을 모두 돌리면서 
         for image in image_paths:
             detect_result = self.detect_motorcycle(image) # 예상 output = [x, y, w, h]  / res.xywh
             print("*************",image,"*************")
-            print(detect_result)
-
-            for res in detect_result.values:
-                motorcycle_loc = (res[0] * 3, res[1] * 3, res[2] * 3, res[3] * 3)
-                motorcycle_mask = self.make_motorcycle_mask(motorcycle_loc)
-
-                bottom_left = (motorcycle_loc[0], motorcycle_loc[1] + motorcycle_loc[3]) # (x, y + h)
-                bottom_right = (motorcycle_loc[0] + motorcycle_loc[2], motorcycle_loc[1] + motorcycle_loc[3]) # (x + w, y + h)
-
-
-                # STATE 2 - First Condition 
-                # Bottom 좌표가 mask에 포함되는 경우
-                if (mask[bottom_left[1]-1, bottom_left[0]-1] != 0) & (mask[bottom_right[1]-1, bottom_right[0]-1] != 0):
-                    print("State 2 _ condition 1 CHECK")
-                    result['STATE_2'] += 1
-
-                # STATE 2 - Second Codition 
-                # 오토바이와 Seg영역이 60%이상 겹칠 때 
-                elif self.percent_rect_area_mask(mask, motorcycle_mask) >= 60:
-                    print("State 2 _ condition 2 CHECK", self.percent_rect_area_mask(mask, motorcycle_mask))
-                    result['STATE_2'] += 1
-                
-                # STATE 1 - First Codition 
-                # 바닥 좌표중 1개와 겹치면서 겹치는 영역이 50% 이상일 때 
-                elif ((mask[bottom_left[1]-1, bottom_left[0]-1] != 0) | (mask[bottom_right[1]-1, bottom_right[0]-1] != 0)) & \
-                    (self.percent_rect_area_mask(mask, motorcycle_mask) >= 40):
-                    result['STATE_1'] += 1
-                
-                # STATE 0 - 위반 아님 
-                else:
-                    print("State 0 _ condition 1 CHECK : 해" )
-                    result['STATE_0'] += 0
-            print(result)
-            print()
-                
+            # print(detect_dresult)
+            result = self.count_motorcycle(detect_result, video_name, 'sidewalk', result)
+            # print(result)
+            # print()
+        time_value = datetime.now()
+        value = ["보행자 도로 위반", result['STATE_2'], time_value, 30]
+        self.insert_data_to_DB(value)
         
-
-    # 가장 마지막 함수가 알고리즘적인 요소들을 보여주는 부분 
     '''                        여기까지 보행자 도로 위반에 필요한 함수들                            '''
     ##########################################################################################
     '''                        여기서 부터  정지선 위반 구역에 대한 코드                           '''
@@ -225,14 +219,11 @@ class DetectCriminalSign:
         # 자르기
         image = img[y: (y + h), x: (x + w)]
         image = Image.fromarray(image)
+
         # 256 * 256 으로 바꾸기
         image = image.resize((wantedSize, wantedSize))
 
         result = self.clasffication_light(image) #신호등 판별
-
-        plt.imshow(image)
-        plt.axis('off')
-        plt.show()
         
         return result 
 
@@ -256,7 +247,47 @@ class DetectCriminalSign:
 
         return result
 
-    
+    # 데이터 프레임 돌면서 cnt 
+    # input : 오토바이 탐지 결과 df, video_code, 정지선 or 보행자, 결과 딕셔너리
+    # output : 결과 딕셔너리 
+    def count_motorcycle(self, df, video_name, mode, result):
+
+        if mode == 'stopline':
+            mask = self.stopline_dict[video_name]
+        elif mode == 'sidewalk':
+            mask = self.sidewalk_dict[video_name]
+        
+        for res in df.values:
+            motorcycle_loc = (res[0], res[1], res[2], res[3])
+            motorcycle_mask = self.make_motorcycle_mask(motorcycle_loc)
+
+            bottom_left = (motorcycle_loc[0], motorcycle_loc[1] + motorcycle_loc[3]) # (x, y + h)
+            bottom_right = (motorcycle_loc[0] + motorcycle_loc[2], motorcycle_loc[1] + motorcycle_loc[3]) # (x + w, y + h)
+
+            # STATE 2 - First Condition 
+            # Bottom 좌표가 mask에 포함되는 경우
+            if (mask[bottom_left[1]-1, bottom_left[0]-1] != 0) & (mask[bottom_right[1]-1, bottom_right[0]-1] != 0):
+                print("State 2 _ condition 1 CHECK")
+                result['STATE_2'] += 1
+
+            # STATE 2 - Second Codition 
+            # 오토바이와 Seg영역이 60%이상 겹칠 때 
+            elif self.percent_rect_area_mask(mask, motorcycle_mask) >= 60:
+                print("State 2 _ condition 2 CHECK", self.percent_rect_area_mask(mask, motorcycle_mask))
+                result['STATE_2'] += 1
+            
+            # STATE 1 - First Codition 
+            # 바닥 좌표중 1개와 겹치면서 겹치는 영역이 50% 이상일 때 
+            elif ((mask[bottom_left[1]-1, bottom_left[0]-1] != 0) | (mask[bottom_right[1]-1, bottom_right[0]-1] != 0)) & \
+                (self.percent_rect_area_mask(mask, motorcycle_mask) >= 40):
+                result['STATE_1'] += 1
+            
+            # STATE 0 - 위반 아님 
+            else:
+                result['STATE_0'] += 1
+            
+            return result
+
     def stopline_criminal_detect(self, image_paths):
 
         video_name = image_paths[0].split('/')[-1].split('_')[0]
@@ -268,6 +299,7 @@ class DetectCriminalSign:
         
         light_loc = self.light_df[self.light_df['video_code'] == video_name].values[0]
 
+        cnt = 0
         for image_path in image_paths:
             image = cv2.imread(image_path)
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -275,7 +307,20 @@ class DetectCriminalSign:
             light_result = self.crop_light_image(image, light_loc)
             if light_result == 0:
                 print("초록불")
+                cnt = 0
+                # shutil.rmtree('./results/') # 해당 폴더 삭제하기
             else: 
                 print("빨간불")
+                # cnt += 1
+                # if cnt == 3:
+                # <1> 오토바이 detect모델 돌려서
+                detect_result = self.detect_motorcycle(image)
+                # <2> 정지선 위반 구역에 있는지 확인하기 
+                result = {'STATE_0' : 0, 'STATE_1':0, 'STATE_2':0}
+                result = self.count_motorcycle(detect_result, video_name, 'stopline', result)
 
+                time_value = datetime.now()
+                value = ["정지선 위반", result['STATE_2'], time_value, 30]
+                self.insert_data_to_DB(value)
+                
 
